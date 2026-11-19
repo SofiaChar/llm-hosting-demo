@@ -1,0 +1,54 @@
+# Central LLM hosting demo
+# One execution hosts an open-source LLM (Ollama, OpenAI-compatible API) and exposes port 11434.
+# Other executions / notebooks in the same environment call it over the VPC's private network.
+#
+# IMPORTANT: run everything in the SAME staging environment (same VPC + worker security group),
+# and make sure the worker security group allows inbound TCP 11434 from itself.
+
+- step:
+    name: llm-server
+    image: ollama/ollama:latest
+    # environment: <staging-environment-slug>   # optional: pin the staging env here, or pick it in the UI
+    command:
+      - bash server/start_server.sh {parameter:model}
+    parameters:
+      - name: model
+        type: string
+        default: qwen2.5:1.5b
+        description: Ollama model tag to serve (qwen2.5:0.5b is faster on CPU, llama3.2:3b is smarter)
+    environment-variables:
+      # Agent-level variable: must be defined here (not exported in the command) to take effect.
+      # Format is <host-port>:<container-port>
+      - name: VH_EXPOSE_PORTS
+        default: "11434:11434"
+      - name: OLLAMA_KEEP_ALIVE
+        default: "-1"          # keep the model loaded in memory forever (no cold starts between requests)
+      - name: OLLAMA_NUM_PARALLEL
+        default: "4"           # serve several clients at once
+
+- step:
+    name: llm-batch-inference
+    environment: staging-aws-eu-west-1-t3-medium
+    image: python:3.11-slim
+    command:
+      - pip install --quiet requests
+      - python client/batch_inference.py {parameters}
+    parameters:
+      - name: llm_endpoint
+        type: string
+        description: "Copy from the llm-server execution log / metadata, e.g. http://10.0.12.34:11434"
+        default: "http://10.0.3.138:11434"
+      - name: model
+        type: string
+        default: qwen2.5:1.5b
+      - name: client_name
+        type: string
+        default: team-a
+        description: Just a label so the demo can show several consumers hitting one model
+      - name: max_tokens
+        type: integer
+        default: 200
+    inputs:
+      - name: prompts
+        optional: true
+        description: Optional .txt file, one prompt per line. Built-in demo prompts are used if empty.
