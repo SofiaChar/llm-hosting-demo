@@ -1,16 +1,18 @@
-# Central LLM hosting demo
+# Shared LLM endpoint on Valohai
 # One execution hosts an open-source LLM (Ollama, OpenAI-compatible API) and exposes port 11434.
-# Other executions / notebooks in the same environment call it over the VPC's private network.
+# Other executions and notebooks call it over your cloud network's private IPs.
 #
-# IMPORTANT: run everything in the SAME staging environment (same VPC + worker security group),
-# and make sure the worker security group allows inbound TCP 11434 from itself.
+# Before running: replace both `environment:` values with your own environment slugs
+# (`vh environments` lists them), and allow inbound TCP 11434 between Valohai workers (see README).
 
 - step:
     name: llm-server
     image: ollama/ollama:latest
-    # environment: <staging-environment-slug>   # optional: pin the staging env here, or pick it in the UI
+    # <-- replace: a GPU environment is recommended (e.g. AWS g4dn.xlarge); Ollama uses the GPU automatically.
+    #     Use on-demand rather than spot so the server isn't reclaimed. A >=8 vCPU / 16 GB CPU machine also works.
+    environment: staging-aws-eu-west-1-g4dn-xlarge
     command:
-      - bash server/start_server.sh {parameter:model}
+      - bash server/start_server.sh {parameter-value:model}
     parameters:
       - name: model
         type: string
@@ -28,8 +30,10 @@
 
 - step:
     name: llm-batch-inference
-    environment: staging-aws-eu-west-1-t3-medium
     image: python:3.11-slim
+    # <-- replace: any small CPU environment. Consumers need no GPU and no model.
+    #     Must be in the same network / security group as the server.
+    environment: staging-aws-eu-west-1-t3-medium
     command:
       - pip install --quiet requests
       - python client/batch_inference.py {parameters}
@@ -37,18 +41,17 @@
       - name: llm_endpoint
         type: string
         description: "Copy from the llm-server execution log / metadata, e.g. http://10.0.12.34:11434"
-        default: "http://10.0.3.138:11434"
       - name: model
         type: string
         default: qwen2.5:1.5b
       - name: client_name
         type: string
         default: team-a
-        description: Just a label so the demo can show several consumers hitting one model
+        description: Label for this consumer (e.g. team or project name); used in the output file name
       - name: max_tokens
         type: integer
         default: 200
     inputs:
       - name: prompts
         optional: true
-        description: Optional .txt file, one prompt per line. Built-in demo prompts are used if empty.
+        description: Optional .txt file, one prompt per line. Built-in example prompts are used if empty.

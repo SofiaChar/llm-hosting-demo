@@ -1,103 +1,172 @@
-# Central LLM hosting on Valohai: demo runbook
+# Shared LLM endpoint on Valohai
 
-**What we're showing:** one Valohai execution hosts an open-source LLM and exposes it on a port. Other jobs and notebooks call it as an endpoint. Nobody else has to download, load or pay a GPU for their own copy of the model.
+Host one open-source LLM in a single Valohai execution and let every other job and notebook call it as an endpoint.
+
+**Why:** without this, every team that wants an LLM ends up downloading the model and paying for a GPU in every job and notebook. With a shared endpoint, you load the model once, on one GPU. Everyone else calls it over HTTP from small, cheap CPU machines, and they all get the same model version.
 
 ```
                ┌──────────────────────────────┐
-               │ llm-server execution         │
+               │ llm-server execution (GPU)   │
                │ Ollama + qwen2.5:1.5b        │
                │ VH_EXPOSE_PORTS=11434:11434  │
                └──────────────▲───────────────┘
-                              │ http://<private-ip>:11434  (SG allows TCP 11434 worker→worker)
+                              │ http://<private-ip>:11434
         ┌─────────────────────┼─────────────────────┐
-  batch job (team-a)   batch job (team-b)     Jupyter notebook
+  batch job (team A)   batch job (team B)     Jupyter notebook
+     CPU, no model        CPU, no model         CPU, no model
 ```
 
-## Files
+In our test, a client on a 2-vCPU machine with no GPU got answers in **~0.45 s on average** (about 130 tokens/s) from a server running on one NVIDIA T4. The whole client job took under 20 s from start to finish.
+
+---
+
+## What's in this repo
 
 | File | What it does |
 |---|---|
-| `valohai.yaml` | Two steps: `llm-server` and `llm-batch-inference` |
-| `server/start_server.sh` | Starts Ollama on 0.0.0.0:11434, pulls the model, prints the endpoint, then stays alive |
-| `client/batch_inference.py` | Waits for the server, runs prompts through `/v1/chat/completions`, logs latency as metadata, saves `results-<client>.jsonl` |
-| `notebooks/llm_client_demo.ipynb` | Same endpoint from a notebook, with plain `requests` and the OpenAI SDK |
+| `valohai.yaml` | Two steps: `llm-server` (hosts the model) and `llm-batch-inference` (calls it) |
+| `server/start_server.sh` | Starts Ollama on port 11434, pulls the model, warms it up, then prints the endpoint and keeps running |
+| `client/batch_inference.py` | Waits for the server, sends prompts to the OpenAI-compatible API, logs latency as Valohai metadata, saves `results-<client_name>.jsonl` |
+| `notebooks/llm_client_demo.ipynb` | Calls the same endpoint from a notebook, with `requests` and the OpenAI SDK |
 
-**Why Ollama + Qwen2.5 1.5B:** it's a single binary in an official Docker image, the API is OpenAI-compatible, the model is about 1 GB and runs fine on CPU, and it uses a GPU automatically if the machine has one. If you need speed on CPU, switch to `qwen2.5:0.5b`.
-
----
-
-## Prep checklist (do this BEFORE the demo, ~45 min)
-
-### 1. Repo + project (5 min)
-- [ ] Push this folder to a git repo (or use `vh exec run --adhoc` from the folder, so no repo is needed).
-- [ ] Create or choose a Valohai project **on staging** and link the repo.
-- [ ] Environments (already set in `valohai.yaml`; all in Staging AWS eu-west-1, so they share the VPC + worker security group):
-
-  | Role | Environment slug | Why |
-  |---|---|---|
-  | LLM server | `staging-aws-eu-west-1-g4dn-xlarge` | T4 GPU gives fast answers live. On-demand, not spot |
-  | Server fallback (no GPU) | `staging-aws-eu-west-1-c5-2xlarge` | 8 vCPU / 16 GB runs 1.5B fine on CPU |
-  | Batch clients | `staging-aws-eu-west-1-t3-medium` | Cheap CPU box, which proves consumers need no GPU |
-  | Notebook | `staging-aws-eu-west-1-t3-medium` (or `c5-xlarge`) | Same reason |
-
-  Avoid the *Pro Trial*, Kubernetes/cluster, GCP/Azure and *Spot* environments for this demo. They're likely a different network or get reclaimed, and port exposure there works differently.
-- [ ] In the server logs, check that Ollama found the GPU (look for `CUDA` / `Tesla T4` in the startup lines).
-
-### 2. AWS security group (10 min). This is the step that usually breaks
-- [ ] In the staging AWS account, open **EC2 → Security Groups** and find the group attached to Valohai workers (usually `valohai-sg-workers`; you can confirm on any running worker instance).
-- [ ] **Add inbound rule:** Type `Custom TCP`, Port `11434`, Source = **the same security group** (self-reference, e.g. `sg-xxxx / valohai-sg-workers`). This lets any worker reach any other worker on 11434.
-- [ ] *(Optional, to curl from your laptop)* add a second rule: TCP 11434 from **My IP** only. **Never** use `0.0.0.0/0`, because Ollama has no authentication.
-- [ ] Note the rule IDs so you can remove them after the demo.
-
-### 3. Dry run the server (10 min)
-- [ ] Run step `llm-server` (UI: *Create execution*, or CLI `vh exec run llm-server --adhoc --environment <slug>`).
-- [ ] In the logs, wait for the `LLM endpoint is READY` box. The first model pull takes 1–2 minutes.
-- [ ] Copy `From other workers: http://10.x.x.x:11434`. The same value also appears in the execution's **metadata** as `llm_endpoint`.
-- [ ] Check the execution has the port mapping. If the private IP prints as `unknown`, get the instance's private IP from the EC2 console instead.
-
-### 4. Dry run one client (5 min)
-- [ ] Run `llm-batch-inference` with `llm_endpoint` = the URL from step 3.
-- [ ] Confirm it prints `LLM server is up`, then Q/A pairs, then summary metadata. Check that `results-team-a.jsonl` appears under outputs.
-
-### 5. Dry run the notebook (10 min)
-- [ ] Start a Valohai Notebook **in the same staging environment** (any Python image, e.g. `python:3.11` or a Jupyter image).
-- [ ] Upload or open `notebooks/llm_client_demo.ipynb`, paste the endpoint into the first cell, and run all cells.
-
-### 6. Decide: keep the server warm or restart live?
-- **Recommended:** start `llm-server` ~15 min before the demo and leave it running, so you skip the pull and warm-up on stage.
-- Keep a finished client execution from the dry run as a backup to show if something fails live.
+**The stack:** [Ollama](https://ollama.com) with **Qwen2.5 1.5B** by default. It ships as a single official Docker image (`ollama/ollama`), has an OpenAI-compatible API, and uses a GPU automatically when one is available. You can swap in a different model with the `model` parameter (see [Choosing a model](#choosing-a-model)).
 
 ---
 
-## Demo script (~10 min)
+## Prerequisites
 
-1. **The problem (1 min).** "Every team that wants an LLM ends up downloading the model and paying for its own GPU in every job and notebook. That's slow, expensive and inconsistent."
-2. **The idea (1 min).** Show the diagram: host the model once, everyone calls it as an endpoint.
-3. **The server (2 min).** Open the running `llm-server` execution. Show the `VH_EXPOSE_PORTS: 11434:11434` env var in the YAML, the READY box, and the `llm_endpoint` metadata.
-4. **Many consumers (3 min).** Launch 2–3 client executions at once with different `client_name` values (team-a, team-b, team-c), from the UI or from the CLI:
-   ```bash
-   for t in team-a team-b team-c; do
-     vh exec run llm-batch-inference --adhoc \
-       --llm-endpoint=http://10.x.x.x:11434 --client-name=$t
-   done
-   ```
-   Point out that the client image is just `python:3.11-slim` with no model and no GPU, and it still gets LLM answers. Show the latency metadata chart and the results output.
-5. **Notebook (2 min).** Run the notebook. The OpenAI-SDK cell shows that existing code only needs a new `base_url`.
-6. **What's next (1 min).** Swap Ollama for vLLM on a GPU for higher throughput, add auth or a proxy, and move to a Valohai Deployment for a permanent endpoint. Several server replicas can sit behind a load balancer.
+1. **A Valohai project** linked to a copy of this repo, or the Valohai CLI (`pip install valohai-cli`) to run it ad hoc from a local folder.
+2. **Two environments in the same cloud network:**
+   - **Server:** a GPU environment is recommended (for example AWS `g4dn.xlarge` with an NVIDIA T4). Use **on-demand rather than spot**, so the server isn't reclaimed mid-session. A CPU machine with at least 8 vCPU and 16 GB RAM also works, just more slowly.
+   - **Clients and notebooks:** any small CPU environment (for example AWS `t3.medium`).
+
+   Run `vh environments` to list your environment slugs, then put them in the two `environment:` fields in `valohai.yaml`.
+3. **A network rule that lets workers talk to each other on port 11434.** This is usually a one-time change by whoever manages your cloud account:
+
+   | Cloud | Rule |
+   |---|---|
+   | **AWS** | EC2 → Security Groups → the Valohai workers group (often `valohai-sg-workers`) → add an inbound rule: **Custom TCP, port 11434, source = that same security group** |
+   | **GCP** | VPC network → Firewall → create an ingress rule on the Valohai VPC: **TCP 11434**, source tag and target tag = the worker tag (often `valohai-worker`) |
+   | **Azure** | The workers' Network Security Group → add an inbound rule: **TCP 11434**, source = the workers' VNet or subnet, action Allow |
+
+   > ⚠️ Ollama has **no authentication**. Never open port 11434 to the internet (`0.0.0.0/0`). Allow it only from your workers' network.
+
+   Your network may already allow traffic between workers. To check, skip ahead to step 2 below: if the client connects, you're fine.
+
+---
+
+## Step 1: Start the LLM server
+
+From the UI, create an execution of step **`llm-server`**. From the CLI:
+
+```bash
+vh exec run llm-server --adhoc
+```
+
+Watch the logs. The first start takes a few minutes, because it pulls the Docker image, downloads the model (~1 GB) and warms it up on the GPU. When it's ready you'll see:
+
+```
+============================================================
+ LLM endpoint is READY
+   Model:              qwen2.5:1.5b
+   From other workers: http://10.0.3.138:11434
+   ...
+============================================================
+```
+
+Copy the **`From other workers`** URL. It's also saved on the execution's **Metadata** tab as `llm_endpoint`.
+
+The server keeps running until you stop it. While it runs, the model stays loaded, so every later request is fast.
+
+### How the port is exposed
+`valohai.yaml` sets the environment variable `VH_EXPOSE_PORTS: "11434:11434"` (format `<host-port>:<container-port>`). The Valohai agent maps that container port onto the worker machine. You can see it in the log as `Mapping <ip>:11434 to container port 11434`.
+
+> `VH_EXPOSE_PORTS` must be defined under the step's `environment-variables` in `valohai.yaml`. Setting it with `export` inside the command has no effect.
+
+---
+
+## Step 2: Run inference jobs against it
+
+Create an execution of step **`llm-batch-inference`** and set **`llm_endpoint`** to the URL from step 1. From the CLI:
+
+```bash
+vh exec run llm-batch-inference --adhoc --llm_endpoint=http://10.0.3.138:11434
+```
+
+Expected log:
+
+```
+LLM server is up at http://10.0.3.138:11434, model 'qwen2.5:1.5b' available
+--- [team-a] prompt 1/5 ---
+Q: In one sentence, what is MLOps?
+A: MLOps stands for Machine Learning Operations, ...
+{"prompt_index": 0, "latency_s": 0.37, "completion_tokens": 39}
+...
+Saved results to /valohai/outputs/results-team-a.jsonl
+```
+
+**Use your own prompts:** attach a `.txt` file (one prompt per line) to the `prompts` input.
+
+**Several consumers at once:** launch a few executions with different `client_name` values. They all share the same model:
+
+```bash
+for t in team-a team-b team-c; do
+  vh exec run llm-batch-inference --adhoc --llm_endpoint=http://10.0.3.138:11434 --client_name=$t
+done
+```
+
+The server handles 4 requests in parallel by default (`OLLAMA_NUM_PARALLEL`) and queues the rest.
+
+---
+
+## Step 3: Use it from a notebook
+
+1. Start a Valohai Notebook **in one of your client environments** (any Python image works).
+2. Open `notebooks/llm_client_demo.ipynb` and paste the endpoint into the first cell.
+3. Run all cells.
+
+Because the API is OpenAI-compatible, existing code usually only needs a new `base_url`:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://10.0.3.138:11434/v1", api_key="not-needed")
+client.chat.completions.create(model="qwen2.5:1.5b", messages=[{"role": "user", "content": "Hello!"}])
+```
+
+---
+
+## Choosing a model
+
+Set the `model` parameter on `llm-server` to any tag from the [Ollama library](https://ollama.com/library). Use the same value for `model` on the clients.
+
+| Model | Size | Good for |
+|---|---|---|
+| `qwen2.5:0.5b` | ~0.4 GB | Fastest; fine on CPU-only servers |
+| `qwen2.5:1.5b` (default) | ~1 GB | Good balance for demos and simple tasks |
+| `llama3.2:3b` | ~2 GB | Better answers, still fits a T4 easily |
+| `qwen2.5:7b` / `llama3.1:8b` | ~5 GB | Noticeably smarter; needs a GPU with ≥ 8 GB |
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause / fix |
+| Symptom | Cause and fix |
 |---|---|
-| Client loops `waiting for LLM server... ConnectTimeout` | Security group rule missing, or the client is in a different VPC/environment. Check step 2. |
-| `ConnectionRefused` | Port not mapped. Make sure `VH_EXPOSE_PORTS` is in the **step's `environment-variables`** (setting it with `export` does not work), and that Ollama is bound to `0.0.0.0` (the script does this). |
-| `model ... not pulled yet` | The server is still downloading. The client retries for 10 min. |
-| You used the public IP and it times out | Use the **private** IP between workers. The public IP only works for sources the SG allows. |
-| Slow answers | You're on CPU. Use `qwen2.5:0.5b`, reduce `max_tokens`, or use a GPU environment (Ollama uses the GPU automatically). |
-| Server execution stops on its own | Check the environment's max runtime and the logs for OOM. 1.5B needs ~3 GB RAM. |
+| Client keeps printing `waiting for LLM server... ConnectTimeout` | The network rule for port 11434 is missing, or the client runs in a different network. Check [Prerequisites](#prerequisites) step 3. |
+| `ConnectionRefused` | The port isn't mapped. Check that `VH_EXPOSE_PORTS` is under the step's `environment-variables`, and that the server log shows the `Mapping …:11434` line. |
+| Client says `model ... not pulled yet` | The server is still downloading. The client retries for up to 10 minutes. |
+| Using the public IP times out | Use the **private** IP (`From other workers`) between workers. The public IP only works for sources your firewall explicitly allows. |
+| Endpoint shows `http://unknown:11434` | Look up the worker's private IP in your cloud console. The instance ID is in the first lines of the execution log. |
+| First request takes a minute or more | One-time GPU warm-up. The server does this before printing READY, so later requests are fast. |
+| Answers are slow (several seconds each) | The server is probably running on CPU. Use a GPU environment or a smaller model, or lower `max_tokens`. |
+| The endpoint changed | Each new server execution can land on a different machine. Copy the new URL from the READY box or the Metadata tab. |
 
-## Cleanup after the demo
-- [ ] **Stop the `llm-server` execution.** It runs (and bills) until you stop it.
-- [ ] Remove the temporary SG rules if they shouldn't stay.
+---
+
+## Good to know
+
+- **Cost:** the server bills for as long as the execution runs. **Stop it when you're done.**
+- **Security:** there's no authentication on the endpoint. Keep it reachable only inside your network. For production, put an authenticating proxy in front of it.
+- **Going further:**
+  - For higher throughput, swap Ollama for [vLLM](https://docs.vllm.ai) on a larger GPU. It's also OpenAI-compatible, so the clients don't change.
+  - For a permanent endpoint, run several server replicas behind a load balancer, or use a Valohai Deployment.
